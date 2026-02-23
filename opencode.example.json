@@ -1,0 +1,41 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "proxy": {
+      "name": "Subscription Router",
+      "api": "http://localhost:4141/v1",
+      "models": {
+        "claude-4.6-sonnet-high": {
+          "name": "Claude 4.6 Sonnet",
+          "limit": { "context": 200000, "output": 16000 },
+          "tool_call": true,
+          "attachment": true
+        },
+        "claude-4.6-opus-high": {
+          "name": "Claude 4.6 Opus",
+          "limit": { "context": 200000, "output": 16000 },
+          "tool_call": true,
+          "attachment": true
+        },
+        "gpt-4o": {
+          "name": "GPT-4o",
+          "limit": { "context": 128000, "output": 16000 },
+          "tool_call": true,
+          "attachment": true
+        },
+        "o4": {
+          "name": "O4",
+          "limit": { "context": 200000, "output": 100000 },
+          "tool_call": true,
+          "attachment": true
+        },
+        "gemini-3-pro": {
+          "name": "Gemini 3 Pro",
+          "limit": { "context": 1000000, "output": 8192 },
+          "tool_call": true,
+          "attachment": true
+        }
+      }
+    }
+  }
+}

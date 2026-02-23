@@ -1,0 +1,34 @@
+{
+  "name": "subscription-model-router",
+  "version": "1.1.0",
+  "description": "Route AI model requests across multiple subscriptions (Cursor, OpenAI) through a single OpenAI-compatible API. Zero dependencies.",
+  "main": "proxy-server.mjs",
+  "type": "module",
+  "bin": {
+    "subscription-model-router": "./proxy-server.mjs"
+  },
+  "scripts": {
+    "start": "node proxy-server.mjs"
+  },
+  "keywords": [
+    "cursor",
+    "openai",
+    "proxy",
+    "ai",
+    "llm",
+    "claude",
+    "gpt",
+    "model-router",
+    "opencode",
+    "claude-code"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YoungMoneyInvestments/Subscription-Model-Router"
+  }
+}
