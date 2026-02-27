@@ -17,6 +17,14 @@ import { execSync } from "child_process";
 import { randomUUID } from "crypto";
 import zlib from "zlib";
 
+// Prevent unhandled errors from crashing the process
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT]', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[UNHANDLED REJECTION]', err?.message || err);
+});
+
 // ============================================================
 // Section 1: Config & Provider Detection
 // ============================================================
@@ -637,6 +645,11 @@ function routeChat(provider, model, messages, stream, requestBody, res) {
 // ============================================================
 
 function handleCursorChat(model, messages, stream, res) {
+  // Prevent unhandled 'error' events on the response from crashing the process
+  res.on('error', (err) => {
+    console.error("Response stream error (suppressed):", err.message);
+  });
+
   if (stream) {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -678,8 +691,19 @@ function handleCursorChat(model, messages, stream, res) {
       },
       (err) => {
         console.error("Stream error:", err.message);
-        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
-        res.end();
+        try {
+          if (!res.writableEnded) {
+            if (!res.headersSent) {
+              res.writeHead(502, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: { message: err.message, type: "upstream_error" } }));
+            } else {
+              res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+              res.end();
+            }
+          }
+        } catch (writeErr) {
+          console.error("Stream error handler failed:", writeErr.message);
+        }
       }
     );
   } else {
@@ -706,8 +730,16 @@ function handleCursorChat(model, messages, stream, res) {
       },
       (err) => {
         console.error("Error:", err.message);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: err.message } }));
+        try {
+          if (!res.writableEnded) {
+            if (!res.headersSent) {
+              res.writeHead(502, { "Content-Type": "application/json" });
+            }
+            res.end(JSON.stringify({ error: { message: err.message, type: "upstream_error" } }));
+          }
+        } catch (writeErr) {
+          console.error("Error handler failed:", writeErr.message);
+        }
       }
     );
   }
