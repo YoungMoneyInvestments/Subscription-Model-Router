@@ -17,13 +17,26 @@ import { execSync } from "child_process";
 import { randomUUID } from "crypto";
 import zlib from "zlib";
 
-// Prevent unhandled errors from crashing the process
+// Track uncaught exceptions — if too many in a short window, self-restart
+// to avoid spinning at 100% CPU in a corrupted state.
+let uncaughtCount = 0;
+const UNCAUGHT_WINDOW_MS = 60_000;
+const UNCAUGHT_THRESHOLD = 20;
+
 process.on('uncaughtException', (err) => {
   console.error('[UNCAUGHT]', err.message);
+  uncaughtCount++;
+  if (uncaughtCount >= UNCAUGHT_THRESHOLD) {
+    console.error(`[FATAL] ${uncaughtCount} uncaught exceptions in window — exiting for launchd restart`);
+    process.exit(1);
+  }
 });
 process.on('unhandledRejection', (err) => {
   console.error('[UNHANDLED REJECTION]', err?.message || err);
 });
+
+// Reset uncaught counter periodically
+setInterval(() => { uncaughtCount = 0; }, UNCAUGHT_WINDOW_MS);
 
 // ============================================================
 // Section 1: Config & Provider Detection
@@ -351,10 +364,28 @@ function cursorStreamChat(model, messages, onData, onEnd, onError) {
 
   let responseData = Buffer.alloc(0);
   let lastDataTime = Date.now();
+  let ended = false;  // Guard: prevent double onEnd/onData from race
+
+  const finish = (source) => {
+    if (ended) return;
+    ended = true;
+    clearInterval(idleCheck);
+    console.log(`  [${source}] Response: ${responseData.length} bytes`);
+    const text = extractTextFromResponse(responseData, prompt);
+    console.log(`  Extracted text: "${text.substring(0, 100)}..."`);
+    if (text) onData(text);
+    onEnd();
+    try { client.close(); } catch (_) {}
+  };
 
   client.on('error', (err) => {
     console.error('  HTTP/2 client error:', err.message);
-    onError(err);
+    if (!ended) {
+      ended = true;
+      clearInterval(idleCheck);
+      onError(err);
+      try { client.close(); } catch (_) {}
+    }
   });
 
   const stream = client.request({
@@ -371,22 +402,19 @@ function cursorStreamChat(model, messages, onData, onEnd, onError) {
 
   const idleCheck = setInterval(() => {
     if (Date.now() - lastDataTime > 3000 && responseData.length > 0) {
-      clearInterval(idleCheck);
-      console.log(`  Idle timeout - Response: ${responseData.length} bytes`);
-      const text = extractTextFromResponse(responseData, prompt);
-      console.log(`  Extracted text: "${text.substring(0, 100)}..."`);
-      if (text) onData(text);
-      onEnd();
-      client.close();
+      finish('idle');
     }
   }, 500);
 
   stream.on('response', (headers) => {
     console.log(`  Cursor API status: ${headers[':status']}`);
     if (headers[':status'] !== 200) {
-      clearInterval(idleCheck);
-      onError(new Error(`HTTP ${headers[':status']}`));
-      client.close();
+      if (!ended) {
+        ended = true;
+        clearInterval(idleCheck);
+        onError(new Error(`HTTP ${headers[':status']}`));
+        try { client.close(); } catch (_) {}
+      }
     }
   });
 
@@ -396,31 +424,23 @@ function cursorStreamChat(model, messages, onData, onEnd, onError) {
   });
 
   stream.on('end', () => {
-    clearInterval(idleCheck);
-    console.log(`  Response received: ${responseData.length} bytes`);
-    const text = extractTextFromResponse(responseData, prompt);
-    console.log(`  Extracted text: "${text.substring(0, 100)}..."`);
-    if (text) onData(text);
-    onEnd();
-    client.close();
+    finish('stream-end');
   });
 
   stream.on('error', (err) => {
-    clearInterval(idleCheck);
-    onError(err);
-    client.close();
+    if (!ended) {
+      ended = true;
+      clearInterval(idleCheck);
+      onError(err);
+      try { client.close(); } catch (_) {}
+    }
   });
 
   stream.write(frame);
   stream.end();
 
   setTimeout(() => {
-    clearInterval(idleCheck);
-    console.log(`  Hard timeout - Response: ${responseData.length} bytes`);
-    const text = extractTextFromResponse(responseData, prompt);
-    if (text) onData(text);
-    onEnd();
-    client.close();
+    finish('hard-timeout');
   }, 60000);
 }
 
