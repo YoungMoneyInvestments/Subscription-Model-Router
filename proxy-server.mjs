@@ -50,11 +50,29 @@ const CLIENT_VERSION = "cli-2026.01.09-231024f";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_BASE = "api.openai.com";
 
+// Cached set of Cursor-hosted model IDs (populated at startup)
+let cursorModelIds = new Set();
+
+// Default Composer model for conversational use. Composer models have
+// unlimited quota on Cursor Pro. composer-2-fast ≈ Kimi K2.5 (quantized Opus 4.6).
+const DEFAULT_COMPOSER_MODEL = 'composer-2-fast';
+
+// Remap 'default' to a specific Composer model for consistent behavior.
+// Non-Composer models pass through as-is.
+function getEffectiveModel(model) {
+  const m = model.toLowerCase();
+  if (m === 'default') return DEFAULT_COMPOSER_MODEL;
+  return model;
+}
+
 // Model → provider routing
 function getProvider(model) {
   const m = model.toLowerCase();
+  // If this model is in Cursor's model list, always route to Cursor
+  if (cursorModelIds.has(m)) return "cursor";
+  // Default routing: OpenAI-branded models go to OpenAI only if we have a key
   if (m.startsWith("gpt-") || m.startsWith("o1-") || m.startsWith("o3-") || m.startsWith("o4-") || m.startsWith("chatgpt-")) {
-    return "openai";
+    return OPENAI_API_KEY ? "openai" : "cursor";
   }
   return "cursor";
 }
@@ -183,6 +201,75 @@ function readVarint(buf, pos) {
   return [result, pos];
 }
 
+// Check if a string is likely natural language text (not binary/protobuf garbage).
+// Allows UTF-8 characters unlike the original ASCII-only check.
+function isLikelyText(str) {
+  if (str.length === 0) return false;
+  let printable = 0;
+  const checkLen = Math.min(str.length, 500);
+  for (let i = 0; i < checkLen; i++) {
+    const code = str.charCodeAt(i);
+    if (code === 0) return false;
+    if (code < 0x09) return false;
+    if (code > 0x0d && code < 0x20) return false;
+    if (code === 0xfffd) return false;
+    if ((code >= 0x20 && code <= 0x7e) || code >= 0x80) printable++;
+  }
+  return printable / checkLen > 0.5;
+}
+
+// Extract readable text segments from raw buffer (fallback when protobuf parsing fails)
+function extractRawTextSegments(buf) {
+  const segments = [];
+  let current = '';
+
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if ((byte >= 0x20 && byte <= 0x7e) || byte === 0x0a || byte === 0x0d || byte === 0x09) {
+      current += String.fromCharCode(byte);
+    } else {
+      if (current.length >= 8 && /[a-zA-Z]{3,}/.test(current)) {
+        segments.push(current);
+      }
+      current = '';
+    }
+  }
+  if (current.length >= 8 && /[a-zA-Z]{3,}/.test(current)) {
+    segments.push(current);
+  }
+
+  return segments;
+}
+
+// Try to extract text from a buffer that might be JSON
+function tryExtractJSON(buf) {
+  try {
+    const str = buf.toString('utf8').trim();
+    if (str.startsWith('{') || str.startsWith('[')) {
+      const json = JSON.parse(str);
+      if (json.choices?.[0]?.message?.content) return json.choices[0].message.content;
+      if (json.choices?.[0]?.delta?.content) return json.choices[0].delta.content;
+      if (json.text) return json.text;
+      if (json.content) return typeof json.content === 'string' ? json.content : null;
+      if (json.error) return null; // Don't treat errors as text
+    }
+    // SSE format
+    if (str.includes('data: ')) {
+      const parts = str.split('\n')
+        .filter(l => l.startsWith('data: ') && l !== 'data: [DONE]')
+        .map(l => {
+          try {
+            const d = JSON.parse(l.slice(6));
+            return d.choices?.[0]?.delta?.content || d.text || '';
+          } catch { return ''; }
+        })
+        .filter(Boolean);
+      if (parts.length > 0) return parts.join('');
+    }
+  } catch {}
+  return null;
+}
+
 function extractStringsFromProtobuf(buf, fieldPath = '', depth = 0) {
   const strings = [];
   let pos = 0;
@@ -214,7 +301,7 @@ function extractStringsFromProtobuf(buf, fieldPath = '', depth = 0) {
         }
 
         const str = data.toString('utf8');
-        if (str.length > 0 && /^[\x20-\x7e\n\r\t]+$/.test(str)) {
+        if (isLikelyText(str)) {
           strings.push({ text: str, fieldPath: currentPath, depth });
         }
       }
@@ -228,35 +315,187 @@ function extractStringsFromProtobuf(buf, fieldPath = '', depth = 0) {
   return strings;
 }
 
+// Returns { text, error? } — error is set for rate limits/API errors
 function extractTextFromResponse(data, userPrompt = '') {
   const allStrings = [];
   let offset = 0;
   let frameIndex = 0;
+  let frameCount = 0;
 
+  // ── Phase 1: Parse Connect-RPC frames ──
   while (offset < data.length) {
     if (data.length - offset < 5) break;
 
-    const compressed = data[offset];
+    const flags = data[offset];
     const length = data.readUInt32BE(offset + 1);
 
-    if (data.length - offset < 5 + length) break;
+    if (length > 1_000_000 || data.length - offset < 5 + length) break;
 
     let payload = data.slice(offset + 5, offset + 5 + length);
+    frameCount++;
 
-    if (compressed === 1) {
-      try { payload = zlib.gunzipSync(payload); } catch(e) {}
+    // Connect-RPC end-of-stream frame (flags bit 1) — contains JSON, not protobuf
+    if (flags & 0x02) {
+      try {
+        const json = JSON.parse(payload.toString('utf8'));
+        // Detect rate limit / API errors and propagate as structured error
+        if (json.error) {
+          const detail = json.error.details?.[0]?.debug?.details?.detail
+            || json.error.details?.[0]?.debug?.details?.title
+            || json.error.message || 'Cursor API error';
+          const code = json.error.code === 'resource_exhausted' ? 429 : 502;
+          console.log(`  [FRAME ${frameIndex}] API error (${code}): ${detail.substring(0, 120)}`);
+          return { text: '', error: { status: code, body: {
+            error: { message: detail, type: json.error.code, code }
+          }}};
+        }
+        // Non-error JSON trailer — try to extract text
+        const jsonText = tryExtractJSON(payload);
+        if (jsonText) {
+          console.log(`  [FRAME ${frameIndex}] JSON text in trailer: ${jsonText.length} chars`);
+          return { text: postProcessText(jsonText) };
+        }
+      } catch {
+        // Not JSON — skip
+      }
+      offset += 5 + length;
+      frameIndex++;
+      continue;
+    }
+
+    if (flags & 0x01) {
+      try { payload = zlib.gunzipSync(payload); } catch {}
     }
 
     const strings = extractStringsFromProtobuf(payload);
-    for (const s of strings) {
-      s.frameIndex = frameIndex;
-    }
+    for (const s of strings) s.frameIndex = frameIndex;
     allStrings.push(...strings);
+
+    if (strings.length === 0 && payload.length > 10) {
+      const jsonText = tryExtractJSON(payload);
+      if (jsonText) {
+        allStrings.push({ text: jsonText, fieldPath: 'json', depth: 0, frameIndex });
+      }
+    }
 
     offset += 5 + length;
     frameIndex++;
   }
 
+  console.log(`  [EXTRACT] ${frameCount} frames parsed, ${allStrings.length} raw strings from ${data.length} bytes`);
+
+  // ── Phase 2: Fallbacks when frame parsing fails ──
+  if (allStrings.length === 0 && data.length > 5) {
+    const directStrings = extractStringsFromProtobuf(data);
+    if (directStrings.length > 0) {
+      console.log(`  [FALLBACK] Direct protobuf parse: ${directStrings.length} strings`);
+      for (const s of directStrings) s.frameIndex = 0;
+      allStrings.push(...directStrings);
+    }
+  }
+
+  if (allStrings.length === 0 && data.length > 5) {
+    const jsonText = tryExtractJSON(data);
+    if (jsonText) {
+      console.log(`  [FALLBACK] JSON parse: ${jsonText.length} chars`);
+      return { text: postProcessText(jsonText) };
+    }
+  }
+
+  if (allStrings.length === 0 && data.length > 5) {
+    const segments = extractRawTextSegments(data);
+    const filtered = segments.filter(s => {
+      if (s.includes('CHAT conversation')) return false;
+      if (s.includes('Do not call any tools')) return false;
+      if (s.includes('[IMPORTANT:')) return false;
+      if (s.includes('Session context')) return false;
+      if (s.includes('/context.txt')) return false;
+      if (/^[0-9a-f-]+$/i.test(s.trim())) return false;
+      // Detect rate limit error in raw text
+      if (s.includes('resource_exhausted')) return false;
+      return true;
+    });
+    if (filtered.length > 0) {
+      const best = filtered.sort((a, b) => b.length - a.length)[0].trim();
+      if (best.length > 10) {
+        console.log(`  [FALLBACK] Raw text: ${best.length} chars: "${best.substring(0, 100)}"`);
+        return { text: postProcessText(best) };
+      }
+    }
+    // Check if raw data is a rate limit error we missed
+    const rawStr = data.toString('utf8');
+    if (rawStr.includes('resource_exhausted') || rawStr.includes('RATE_LIMITED')) {
+      return { text: '', error: { status: 429, body: {
+        error: { message: 'Cursor API rate limit exceeded', type: 'resource_exhausted', code: 429 }
+      }}};
+    }
+    const hex = data.slice(0, Math.min(100, data.length)).toString('hex').match(/.{1,2}/g)?.join(' ') || '';
+    console.log(`  [DEBUG] 0 strings. First 100 bytes: ${hex}`);
+    return { text: '' };
+  }
+
+  // ── Phase 3: Streaming concatenation (for Composer token-by-token responses) ──
+  // Composer models stream tool calls + text across many small protobuf frames.
+  // Filter out metadata/tool artifacts, then concatenate remaining text fragments.
+  if (allStrings.length > 5) {
+    const streamFragments = allStrings
+      .filter(s => {
+        const t = s.text;
+        if (t.length === 0) return false;
+        // UUIDs and hex strings
+        if (/^[0-9a-f-]{16,}$/i.test(t) && !t.includes(' ')) return false;
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(t)) return false;
+        // Tool-call IDs and metadata
+        if (/^(call_|fc_|toolu_)/.test(t)) return false;
+        if (/^(true|false|null|undefined)$/i.test(t)) return false;
+        if (/^(content|count|files_with_matches|file_search|code_search|grep|find|read|write|edit)$/i.test(t)) return false;
+        // Known metadata fields
+        if (t.includes('/context.txt') || t.includes('Session context')) return false;
+        if (t.includes('"role"') || t.includes('user_query')) return false;
+        if (t.includes('providerOptions') || t.includes('serverGenReqId')) return false;
+        if (t.includes('composer-') || t.includes('Composer ')) return false;
+        // Prompt echoes — check against the system message and user prompt
+        if (userPrompt && t.includes(userPrompt)) return false;
+        if (userPrompt && t === userPrompt) return false;
+        return true;
+      })
+      .sort((a, b) => a.frameIndex - b.frameIndex || a.depth - b.depth);
+
+    // Deduplicate WITHIN each frame: take the deepest string per frame.
+    // Deeper = more granular token, less protobuf overhead.
+    // Never dedup across frames — different frames carry different tokens.
+    const distinctFrames = new Set(streamFragments.map(f => f.frameIndex));
+
+    if (distinctFrames.size > 15) {
+      const byFrame = new Map();
+      for (const frag of streamFragments) {
+        if (!byFrame.has(frag.frameIndex)) byFrame.set(frag.frameIndex, []);
+        byFrame.get(frag.frameIndex).push(frag);
+      }
+
+      const deduped = [];
+      for (const [, frags] of byFrame) {
+        // Within this frame, take the deepest string (most granular token)
+        const maxDepth = Math.max(...frags.map(f => f.depth));
+        const deepest = frags.filter(f => f.depth === maxDepth);
+        // If multiple at same depth, take the shortest (least overhead)
+        deepest.sort((a, b) => a.text.length - b.text.length);
+        if (deepest.length > 0) deduped.push(deepest[0]);
+      }
+
+      deduped.sort((a, b) => a.frameIndex - b.frameIndex);
+
+      if (deduped.length > 3) {
+        const concatenated = deduped.map(f => f.text).join('');
+        if (concatenated.length > 30 && /[a-zA-Z]{3,}/.test(concatenated)) {
+          console.log(`  [STREAM-CONCAT] ${deduped.length} tokens from ${distinctFrames.size} frames → ${concatenated.length} chars`);
+          return { text: postProcessText(concatenated) };
+        }
+      }
+    }
+  }
+
+  // ── Phase 4: Score and rank individual strings (original Composer approach) ──
   const userPromptLower = userPrompt.toLowerCase().trim();
   const userPromptWords = userPromptLower.split(/\s+/).filter(w => w.length > 3);
 
@@ -274,6 +513,9 @@ function extractTextFromResponse(data, userPrompt = '') {
       if (/^[0-9a-f-]{20,}$/i.test(t) && !t.includes(' ')) return false;
       if (t.includes('You are a powerful')) return false;
       if (t.includes('"role"')) return false;
+      if (t.includes('SYSTEM INSTRUCTIONS')) return false;
+      if (t.includes('OUTPUT RULES')) return false;
+      if (t.includes('CONVERSATION HISTORY')) return false;
       if (t.includes('providerOptions')) return false;
       if (t.includes('serverGenReqId')) return false;
       if (t.includes('user_query')) return false;
@@ -282,6 +524,15 @@ function extractTextFromResponse(data, userPrompt = '') {
       if (t.includes('/context.txt')) return false;
       if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)) return false;
       if (t.length < 3 && !/\w/.test(t)) return false;
+      if (/^call_/.test(t)) return false;
+      if (/^fc_/.test(t)) return false;
+      if (/^toolu_/.test(t)) return false;
+      if (/^[0-9a-f-]{30,}/i.test(t) && !t.includes(' ')) return false;
+      if (/^(true|false|null|undefined)$/i.test(t)) return false;
+      if (/^(content|count|files_with_matches|file_search|code_search|grep|find|read|write|edit)$/i.test(t)) return false;
+      if (!t.includes(' ') && t.length < 60 && /^[a-zA-Z0-9_.\-\/\\|*+?{}[\]^$()]+$/.test(t)) return false;
+      if (t.length > 5 && !t.includes(' ') && (t.match(/[^a-zA-Z0-9\s]/g) || []).length > t.length * 0.3) return false;
+      if (t.length < 20 && !t.includes(' ')) return false;
 
       return true;
     })
@@ -311,13 +562,8 @@ function extractTextFromResponse(data, userPrompt = '') {
         if (matchRatio > 0.8) score -= 500;
       }
 
-      if (t.length > 5 && userPromptLower.includes(tLower)) {
-        score -= 1000;
-      }
-      if (userPrompt.length > 5 && tLower.includes(userPromptLower)) {
-        score -= 1000;
-      }
-
+      if (t.length > 5 && userPromptLower.includes(tLower)) score -= 1000;
+      if (userPrompt.length > 5 && tLower.includes(userPromptLower)) score -= 1000;
       if (t.includes('/') && t.length < 50) score -= 50;
       if (/^[A-Z][a-z]+ [A-Z0-9][a-z0-9.-]*$/i.test(t)) score -= 30;
 
@@ -325,21 +571,91 @@ function extractTextFromResponse(data, userPrompt = '') {
     })
     .sort((a, b) => b.score - a.score);
 
-  if (process.env.DEBUG) {
-    console.log('Top 5 candidates:');
-    candidates.slice(0, 5).forEach((c, i) => {
-      console.log(`  ${i+1}. score=${c.score} frame=${c.frameIndex} depth=${c.depth}: "${c.text.substring(0, 60)}..."`);
+  console.log(`  [EXTRACT] ${candidates.length} candidates from ${allStrings.length} strings`);
+  if (candidates.length > 0) {
+    const top = candidates[0];
+    console.log(`    Top: score=${top.score} frame=${top.frameIndex} len=${top.text.trim().length}: "${top.text.trim().substring(0, 120)}"`);
+  } else {
+    const viable = allStrings.filter(s => s.text.trim().length > 20 && s.text.includes(' '));
+    console.log(`  [EXTRACT] ${viable.length} strings with len>20 and spaces (all filtered):`);
+    viable.slice(0, 8).forEach((s, i) => {
+      console.log(`    ${i+1}. frame=${s.frameIndex} depth=${s.depth} len=${s.text.trim().length}: "${s.text.trim().substring(0, 120)}"`);
     });
   }
 
   if (candidates.length > 0) {
-    return candidates[0].text.trim();
+    const topScore = candidates[0].score;
+    const threshold = Math.max(topScore * 0.4, topScore - 100);
+    const selected = candidates
+      .filter(c => c.score >= threshold && c.score > 0)
+      .reduce((acc, c) => {
+        const isDupe = acc.some(a =>
+          a.text.includes(c.text) || c.text.includes(a.text)
+        );
+        if (!isDupe) acc.push(c);
+        return acc;
+      }, [])
+      .sort((a, b) => a.frameIndex - b.frameIndex || a.depth - b.depth);
+
+    let result;
+    if (selected.length > 1) {
+      result = selected.map(s => s.text.trim()).join('\n\n');
+    } else {
+      result = candidates[0].text.trim();
+    }
+
+    return { text: postProcessText(result) };
   }
 
-  return '';
+  return { text: '' };
+}
+
+// Post-process extracted text: strip Composer narration artifacts
+function postProcessText(text) {
+  let result = text;
+
+  // Strip short leaked artifacts at the very start (e.g., "cli\n", "cliYou...")
+  result = result.replace(/^cli\s*\n?/, '');
+
+  // Strip Composer bold status headers: standalone bold lines followed by newline.
+  // e.g., "**Fixing auth middleware**\n\n" — but NOT inline bold like "**TCP** is..."
+  result = result.replace(/^\*\*[A-Z][^*]{3,80}\*\*\s*$/gm, '');
+
+  // Strip trailing lone double-asterisks from partial headers
+  result = result.replace(/\*\*\s*$/, '');
+
+  // Strip Composer narration meta-text (the model narrating its own actions)
+  // e.g., "I'm providing guidance on fixing expired Google OAuth issues via 3 steps."
+  result = result.replace(/^I'm (providing|addressing|explaining|clarifying|analyzing|looking|searching|checking)[^\n]{10,100}\.\s*\n*/i, '');
+
+  // Remove trailing repetition: Composer sometimes appends a partial repeat
+  // of earlier content at the end. Scan the last 30% of text for any 20-char
+  // segment that also appears in the first 70%.
+  if (result.length > 100) {
+    const cutoff = Math.floor(result.length * 0.7);
+    const tail = result.substring(cutoff);
+    for (let start = 0; start < tail.length - 20; start++) {
+      const segment = tail.substring(start, start + 20);
+      const pos = result.indexOf(segment);
+      if (pos >= 0 && pos < cutoff) {
+        result = result.substring(0, cutoff + start).trimEnd();
+        break;
+      }
+    }
+  }
+
+  // Clean up multiple consecutive newlines
+  result = result.replace(/\n{3,}/g, '\n\n');
+
+  return result.trim();
 }
 
 function cursorStreamChat(model, messages, onData, onEnd, onError) {
+  const effectiveModel = getEffectiveModel(model);
+  if (effectiveModel !== model) {
+    console.log(`  [REMAP] ${model} → ${effectiveModel}`);
+  }
+
   const token = getToken();
 
   const extractText = (content) => {
@@ -353,26 +669,61 @@ function cursorStreamChat(model, messages, onData, onEnd, onError) {
     return String(content || '');
   };
 
-  const lastUserMsg = messages.filter(m => m.role === 'user').pop();
-  const prompt = extractText(lastUserMsg?.content);
-  const context = messages.map(m => `${m.role}: ${extractText(m.content)}`).join('\n');
+  const systemMsgs = messages.filter(m => m.role === 'system');
+  const nonSystemMsgs = messages.filter(m => m.role !== 'system');
+  const lastUserMsg = nonSystemMsgs.filter(m => m.role === 'user').pop();
+  const userPrompt = extractText(lastUserMsg?.content);
 
-  const { payload } = buildProtobufRequest(prompt, model, context);
+  // Build prompt: system messages + user question.
+  // No anti-tool injection — Composer ignores it (tool calling is architectural)
+  // and it leaks into extracted text as garbage.
+  const promptParts = [];
+
+  if (systemMsgs.length > 0) {
+    for (const msg of systemMsgs) {
+      promptParts.push(extractText(msg.content));
+    }
+  }
+
+  promptParts.push(userPrompt);
+
+  const prompt = promptParts.join('\n\n');
+
+  const historyMsgs = nonSystemMsgs.slice(0, -1);
+  let context = '';
+  if (historyMsgs.length > 0) {
+    context = historyMsgs
+      .map(m => `${m.role}: ${extractText(m.content)}`)
+      .join('\n');
+  }
+
+  const { payload } = buildProtobufRequest(prompt, effectiveModel, context);
   const frame = createFrame(payload);
 
   const client = http2.connect(`https://${AGENT_BASE}`);
 
   let responseData = Buffer.alloc(0);
   let lastDataTime = Date.now();
-  let ended = false;  // Guard: prevent double onEnd/onData from race
+  let ended = false;
+  let responseContentType = '';
 
   const finish = (source) => {
     if (ended) return;
     ended = true;
     clearInterval(idleCheck);
-    console.log(`  [${source}] Response: ${responseData.length} bytes`);
-    const text = extractTextFromResponse(responseData, prompt);
-    console.log(`  Extracted text: "${text.substring(0, 100)}..."`);
+    console.log(`  [${source}] Response: ${responseData.length} bytes, Content-Type: ${responseContentType}`);
+    const result = extractTextFromResponse(responseData, prompt);
+    if (result.error) {
+      console.log(`  [ERROR] ${result.error.status}: ${result.error.body?.error?.message || 'Unknown'}`);
+      const err = new Error(result.error.body?.error?.message || 'Cursor API error');
+      err.status = result.error.status;
+      err.body = result.error.body;
+      onError(err);
+      try { client.close(); } catch (_) {}
+      return;
+    }
+    const text = result.text;
+    console.log(`  Extracted text (${text.length} chars): "${text.substring(0, 150)}${text.length > 150 ? '...' : ''}"`);
     if (text) onData(text);
     onEnd();
     try { client.close(); } catch (_) {}
@@ -407,7 +758,8 @@ function cursorStreamChat(model, messages, onData, onEnd, onError) {
   }, 500);
 
   stream.on('response', (headers) => {
-    console.log(`  Cursor API status: ${headers[':status']}`);
+    responseContentType = headers['content-type'] || '';
+    console.log(`  Cursor API status: ${headers[':status']} content-type: ${responseContentType}`);
     if (headers[':status'] !== 200) {
       if (!ended) {
         ended = true;
@@ -710,12 +1062,14 @@ function handleCursorChat(model, messages, stream, res) {
         res.end();
       },
       (err) => {
-        console.error("Stream error:", err.message);
+        const status = err.status || 502;
+        const body = err.body || { error: { message: err.message, type: "upstream_error" } };
+        console.error(`  Stream error (${status}):`, err.message);
         try {
           if (!res.writableEnded) {
             if (!res.headersSent) {
-              res.writeHead(502, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: { message: err.message, type: "upstream_error" } }));
+              res.writeHead(status, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(body));
             } else {
               res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
               res.end();
@@ -749,13 +1103,15 @@ function handleCursorChat(model, messages, stream, res) {
         }));
       },
       (err) => {
-        console.error("Error:", err.message);
+        const status = err.status || 502;
+        const body = err.body || { error: { message: err.message, type: "upstream_error" } };
+        console.error(`  Error (${status}):`, err.message);
         try {
           if (!res.writableEnded) {
             if (!res.headersSent) {
-              res.writeHead(502, { "Content-Type": "application/json" });
+              res.writeHead(status, { "Content-Type": "application/json" });
             }
-            res.end(JSON.stringify({ error: { message: err.message, type: "upstream_error" } }));
+            res.end(JSON.stringify(body));
           }
         } catch (writeErr) {
           console.error("Error handler failed:", writeErr.message);
@@ -839,7 +1195,17 @@ async function handleRequest(req, res) {
 // ============================================================
 
 const server = http.createServer(handleRequest);
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
+  // Prefetch Cursor model list for routing decisions
+  if (cursorAvailable) {
+    try {
+      const models = await getCursorModels();
+      cursorModelIds = new Set(models.map(m => m.id.toLowerCase()));
+      console.log(`  Cached ${cursorModelIds.size} Cursor models`);
+    } catch (err) {
+      console.error(`  Failed to cache Cursor models: ${err.message}`);
+    }
+  }
   const providers = [];
   if (cursorAvailable) providers.push("Cursor (Keychain)");
   if (openaiAvailable) providers.push("OpenAI (API Key)");
